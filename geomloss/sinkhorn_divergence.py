@@ -29,6 +29,7 @@ with a Kullback-Leibler divergence defined through:
     ~+~ \langle \, \beta   \,,\, 1 \,\rangle ~\geqslant~ 0.
 """
 
+from collections.abc import Callable
 import numpy as np
 import torch
 from functools import partial
@@ -273,6 +274,8 @@ def sinkhorn_loop(
     extrapolate=None,
     debias=True,
     last_extrapolation=True,
+    f_regularizer: Callable | None = None,
+    g_regularizer: Callable | None = None,
 ):
     r"""Implements the (possibly multiscale) symmetric Sinkhorn loop,
     with the epsilon-scaling (annealing) heuristic.
@@ -387,6 +390,14 @@ def sinkhorn_loop(
             to backpropagate trough the full Sinkhorn loop.
             Defaults to True.
 
+        f_regularizer (Callable, optional): Accepts the potential f_i on x and i
+            (the current loop number) and returns a vector to be added to f_i to
+            get f_(i+1)
+
+        g_regularizer (Callable, optional): Accepts the potential g_i on y and i
+            (the current loop number) and returns a vector to be added to g_i to
+            get g_(i+1)
+
     Returns:
         4-uple of Tensors: The four optimal dual potentials
             `(f_aa, g_bb, g_ab, f_ba)` that are respectively
@@ -415,6 +426,8 @@ def sinkhorn_loop(
         # Cost "matrices" C(x_i, x_j) and C(y_i, y_j):
         if debias:  # Only used for the "a <-> a" and "b <-> b" problems.
             C_xxs, C_yys = [C_xxs], [C_yys]
+        else:
+            C_xxs, C_yys = None, None
 
     # N.B.: We don't let users backprop through the Sinkhorn iterations
     #       and branch instead on an explicit formula "at convergence"
@@ -432,7 +445,8 @@ def sinkhorn_loop(
     #       "Super-efficiency of automatic differentiation for
     #       functions defined as a minimum", Ablin, Peyré, Moreau (2020)
     #       https://arxiv.org/pdf/2002.03722.pdf.
-    torch.autograd.set_grad_enabled(False)
+    # torch.autograd.set_grad_enabled(False)
+    torch.set_grad_enabled(False)
 
     # Line 1 (in Algorithm 3.6 from Jean Feydy's PhD thesis) ---------------------------
 
@@ -449,8 +463,10 @@ def sinkhorn_loop(
     # Load the measures and cost matrices at the current scale:
     a_log, b_log = a_logs[k], b_logs[k]
     C_xy, C_yx = C_xys[k], C_yxs[k]  # C(x_i, y_j), C(y_i, x_j)
-    if debias:  # Info for the "a <-> a" and "b <-> b" problems
+    if debias and C_xxs is not None and C_yys is not None:  # Info for the "a <-> a" and "b <-> b" problems
         C_xx, C_yy = C_xxs[k], C_yys[k]  # C(x_i, x_j), C(y_j, y_j)
+    else:
+        C_xx, C_yy = None, None
 
     # Line 2 ---------------------------------------------------------------------------
     # Start with a decent initialization for the dual vectors:
@@ -464,6 +480,13 @@ def sinkhorn_loop(
     if debias:
         f_aa = damping * softmin(eps, C_xx, a_log)  # a -> a
         g_bb = damping * softmin(eps, C_yy, b_log)  # a -> a
+    else:
+        f_aa, g_bb = None, None
+
+    if f_regularizer is None:
+        f_regularizer = lambda f, _: torch.zeros_like(f)
+    if g_regularizer is None:
+        g_regularizer = lambda g, _: torch.zeros_like(g)
 
     # Lines 4-5: eps-scaling descent ---------------------------------------------------
     for i, eps in enumerate(eps_list):  # See Fig. 3.25-26 in Jean Feydy's PhD thesis.
@@ -481,17 +504,27 @@ def sinkhorn_loop(
         ft_ba = damping * softmin(eps, C_xy, b_log + g_ab / eps)  # b -> a
         gt_ab = damping * softmin(eps, C_yx, a_log + f_ba / eps)  # a -> b
 
+        ft_ba_reg = damping * f_regularizer(f_ba, i)
+        gt_ab_reg = damping * g_regularizer(g_ab, i)
+
         # See Fig. 3.21 in Jean Feydy's PhD thesis to see the importance
         # of debiasing when the target "blur" or "eps**(1/p)" value is larger
         # than the average distance between samples x_i, y_j and their neighbours.
         if debias:
             ft_aa = damping * softmin(eps, C_xx, a_log + f_aa / eps)  # a -> a
             gt_bb = damping * softmin(eps, C_yy, b_log + g_bb / eps)  # b -> b
+            
+            ft_aa_reg = damping * f_regularizer(f_aa, i)
+            gt_bb_reg = damping * g_regularizer(g_bb, i)
+        else:
+            ft_aa, gt_bb = None, None
+
+            ft_aa_reg, gt_bb_reg = None, None
 
         # Symmetrized updates - see Fig. 3.24.b in Jean Feydy's PhD thesis:
-        f_ba, g_ab = 0.5 * (f_ba + ft_ba), 0.5 * (g_ab + gt_ab)  # OT(a,b) wrt. a, b
-        if debias:
-            f_aa, g_bb = 0.5 * (f_aa + ft_aa), 0.5 * (g_bb + gt_bb)  # OT(a,a), OT(b,b)
+        f_ba, g_ab = 0.5 * (f_ba + ft_ba) + ft_ba_reg, 0.5 * (g_ab + gt_ab) + gt_ab_reg  # OT(a,b) wrt. a, b
+        if debias and f_aa is not None and g_bb is not None:
+            f_aa, g_bb = 0.5 * (f_aa + ft_aa) + ft_aa_reg, 0.5 * (g_bb + gt_bb) + gt_bb_reg  # OT(a,a), OT(b,b)
 
         # Line 8: jump from a coarse to a finer scale ----------------------------------
         # In multi-scale mode, we work we increasingly detailed representations
@@ -520,11 +553,14 @@ def sinkhorn_loop(
         if i in jumps:
             if i == len(eps_list) - 1:  # Last iteration: just extrapolate!
                 C_xy_fine, C_yx_fine = C_xys[k + 1], C_yxs[k + 1]
-                if debias:
+                if debias and C_xxs is not None and C_yys is not None:
                     C_xx_fine, C_yy_fine = C_xxs[k + 1], C_yys[k + 1]
+                else:
+                    C_xx_fine, C_yy_fine = None, None
 
                 last_extrapolation = False  # No need to re-extrapolate after the loop
-                torch.autograd.set_grad_enabled(True)
+                # torch.autograd.set_grad_enabled(True)
+                torch.set_grad_enabled(True)
 
             else:  # It's worth investing some time on kernel truncation...
                 # The lines below implement the Kernel truncation trick,
@@ -542,43 +578,49 @@ def sinkhorn_loop(
                 # and rely instead on the separability of the Gaussian convolution kernel.
 
                 # Line 9: a <-> b ------------------------------------------------------
-                C_xy_fine, C_yx_fine = kernel_truncation(
-                    C_xy,
-                    C_yx,
-                    C_xys[k + 1],
-                    C_yxs[k + 1],
-                    f_ba,
-                    g_ab,
-                    eps,
-                    truncate=truncate,
-                    cost=cost,
-                )
+                if kernel_truncation is not None:
+                    C_xy_fine, C_yx_fine = kernel_truncation(
+                        C_xy,
+                        C_yx,
+                        C_xys[k + 1],
+                        C_yxs[k + 1],
+                        f_ba,
+                        g_ab,
+                        eps,
+                        truncate=truncate,
+                        cost=cost,
+                    )
 
-                if debias:
-                    # Line 10: a <-> a  ------------------------------------------------
-                    C_xx_fine, _ = kernel_truncation(
-                        C_xx,
-                        C_xx,
-                        C_xxs[k + 1],
-                        C_xxs[k + 1],
-                        f_aa,
-                        f_aa,
-                        eps,
-                        truncate=truncate,
-                        cost=cost,
-                    )
-                    # Line 11: b <-> b -------------------------------------------------
-                    C_yy_fine, _ = kernel_truncation(
-                        C_yy,
-                        C_yy,
-                        C_yys[k + 1],
-                        C_yys[k + 1],
-                        g_bb,
-                        g_bb,
-                        eps,
-                        truncate=truncate,
-                        cost=cost,
-                    )
+                    if debias and C_xxs is not None and C_yys is not None:
+                        # Line 10: a <-> a  ------------------------------------------------
+                        C_xx_fine, _ = kernel_truncation(
+                            C_xx,
+                            C_xx,
+                            C_xxs[k + 1],
+                            C_xxs[k + 1],
+                            f_aa,
+                            f_aa,
+                            eps,
+                            truncate=truncate,
+                            cost=cost,
+                        )
+                        # Line 11: b <-> b -------------------------------------------------
+                        C_yy_fine, _ = kernel_truncation(
+                            C_yy,
+                            C_yy,
+                            C_yys[k + 1],
+                            C_yys[k + 1],
+                            g_bb,
+                            g_bb,
+                            eps,
+                            truncate=truncate,
+                            cost=cost,
+                        )
+                    else:
+                        C_xx_fine, C_yy_fine = None, None
+                else:
+                    C_xy_fine, C_yx_fine = None, None
+                    C_xx_fine, C_yy_fine = None, None
 
             # Line 12: extrapolation step ----------------------------------------------
             # We extra/inter-polate the values of the dual potentials from
@@ -589,15 +631,16 @@ def sinkhorn_loop(
             # On images and volumes, we simply rely on (bi/tri-)linear interpolation.
             #
             # N.B.: the cross-updates below *must* be done in parallel!
-            f_ba, g_ab = (
-                extrapolate(f_ba, g_ab, eps, damping, C_xy, b_log, C_xy_fine),
-                extrapolate(g_ab, f_ba, eps, damping, C_yx, a_log, C_yx_fine),
-            )
+            if extrapolate is not None:
+                f_ba, g_ab = (
+                    extrapolate(f_ba, g_ab, eps, damping, C_xy, b_log, C_xy_fine),
+                    extrapolate(g_ab, f_ba, eps, damping, C_yx, a_log, C_yx_fine),
+                )
 
-            # Extrapolation for the symmetric problems:
-            if debias:
-                f_aa = extrapolate(f_aa, f_aa, eps, damping, C_xx, a_log, C_xx_fine)
-                g_bb = extrapolate(g_bb, g_bb, eps, damping, C_yy, b_log, C_yy_fine)
+                # Extrapolation for the symmetric problems:
+                if debias and C_xx is not None and C_yy is not None and C_xx_fine is not None and C_yy_fine is not None:
+                    f_aa = extrapolate(f_aa, f_aa, eps, damping, C_xx, a_log, C_xx_fine)
+                    g_bb = extrapolate(g_bb, g_bb, eps, damping, C_yy, b_log, C_yy_fine)
 
             # Line 13: update the measure weights and cost "matrices" ------------------
             k = k + 1
@@ -610,7 +653,8 @@ def sinkhorn_loop(
     # As detailed above (around "torch.autograd.set_grad_enabled(False)"),
     # this allows us to retrieve correct expressions for the gradient
     # without having to backprop through the whole Sinkhorn loop.
-    torch.autograd.set_grad_enabled(True)
+    # torch.autograd.set_grad_enabled(True)
+    torch.set_grad_enabled(True)
 
     if last_extrapolation:
         # The cross-updates should be done in parallel!

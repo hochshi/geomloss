@@ -1,5 +1,6 @@
 """Implements the (debiased) Sinkhorn divergence between sampled measures."""
 
+from collections.abc import Callable
 import numpy as np
 import torch
 from functools import partial
@@ -293,6 +294,7 @@ def softmin_online_lazytensor(eps, C_xy, h_y, p=2):
 
 def lse_lazytensor(p, D, batchdims=(1,)):
     """This implementation is currently disabled."""
+    raise NotImplementedError
 
     x_i = Vi(0, D)
     y_j = Vj(1, D)
@@ -335,7 +337,8 @@ def lse_genred(cost, D, dtype="float32"):
     return log_conv
 
 
-def softmin_online(eps, C_xy, h_y, log_conv=None):
+# def softmin_online(eps, C_xy, h_y, log_conv=None):
+def softmin_online(eps, C_xy, h_y, log_conv:Callable):
     x, y = C_xy
     # KeOps is pretty picky on the input shapes...
     batch = x.dim() > 2
@@ -360,6 +363,8 @@ def sinkhorn_online(
     cost=None,
     debias=True,
     potentials=False,
+    f_regularizer=None,
+    g_regularizer=None,
     **kwargs,
 ):
     B, N, D = x.shape
@@ -408,6 +413,8 @@ def sinkhorn_online(
         eps_list,
         rho,
         debias=debias,
+        f_regularizer=f_regularizer,
+        g_regularizer=g_regularizer
     )
 
     return sinkhorn_cost(
@@ -443,7 +450,8 @@ def keops_lse(cost, D, dtype="float32"):
     return log_conv
 
 
-def softmin_multiscale(eps, C_xy, f_y, log_conv=None):
+# def softmin_multiscale(eps, C_xy, f_y, log_conv=None):
+def softmin_multiscale(eps, C_xy, f_y, log_conv: Callable):
     x, y, ranges_x, ranges_y, ranges_xy = C_xy
     # KeOps is pretty picky on the input shapes...
     return -eps * log_conv(
@@ -471,7 +479,7 @@ def clusterize(a, x, scale=None, labels=None):
     if (
         labels is None and scale is None
     ):  # No clustering, single-scale Sinkhorn on the way...
-        return [a], [x], []
+        return [a], [x], [], perm
 
     else:  # As of today, only two-scale Sinkhorn is implemented:
         # Compute simple (voxel-like) class labels:
@@ -492,7 +500,7 @@ def clusterize(a, x, scale=None, labels=None):
 
 
 def kernel_truncation(
-    C_xy, C_yx, C_xy_, C_yx_, f_ba, g_ab, eps, truncate=None, cost=None, verbose=False
+    C_xy, C_yx, C_xy_, C_yx_, f_ba, g_ab, eps, cost, truncate=None, verbose=False
 ):
     """Prunes out useless parts of the (block-sparse) cost matrices for finer scales.
 
@@ -531,7 +539,7 @@ def kernel_truncation(
         )
 
 
-def extrapolate_samples(f_ba, g_ab, eps, damping, C_xy, b_log, C_xy_, softmin=None):
+def extrapolate_samples(f_ba, g_ab, eps, damping, C_xy, b_log, C_xy_, softmin):
     yd = C_xy[1]  # Source points (coarse)
     x_ = C_xy_[0]  # Target points (fine)
 
