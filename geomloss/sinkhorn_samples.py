@@ -350,25 +350,10 @@ def softmin_online(eps, C_xy, h_y, log_conv:Callable):
     return out.view(B, -1) if batch else out.view(1, -1)
 
 
-def sinkhorn_online(
-    a,
-    x,
-    b,
-    y,
-    p=2,
-    blur=0.05,
-    reach=None,
-    diameter=None,
-    scaling=0.5,
-    cost=None,
-    debias=True,
-    potentials=False,
-    f_regularizer=None,
-    g_regularizer=None,
-    **kwargs,
-):
-    B, N, D = x.shape
-    B, M, _ = y.shape
+def generate_softmin(x, y, p=2, cost=None):
+    
+    B, _, D = x.shape
+    B, _, _ = y.shape
 
     if cost is None and B > 1:
         if True:
@@ -392,6 +377,29 @@ def sinkhorn_online(
 
         my_lse = lse_genred(cost, D, dtype=str(x.dtype)[6:])
         softmin = partial(softmin_online, log_conv=my_lse)
+    return softmin
+
+
+def sinkhorn_online(
+    a,
+    x,
+    b,
+    y,
+    p=2,
+    blur=0.05,
+    reach=None,
+    diameter=None,
+    scaling=0.5,
+    cost=None,
+    debias=True,
+    potentials=False,
+    f_regularizer=None,
+    g_regularizer=None,
+    softmin=None,
+    **kwargs,
+):
+    if softmin is None:
+        softmin = generate_softmin(x, y, p, cost)
 
     # The "cost matrices" are implicitly encoded in the point clouds,
     # and re-computed on-the-fly:

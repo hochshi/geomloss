@@ -191,6 +191,7 @@ class SamplesLoss(Module):
         backend="auto",
         f_regularizer = None,
         g_regularizer = None,
+        softmin = None,
     ):
         super(SamplesLoss, self).__init__()
         self.loss = loss
@@ -209,6 +210,7 @@ class SamplesLoss(Module):
         self.verbose = verbose
         self.f_regularizer = f_regularizer
         self.g_regularizer = g_regularizer
+        self.softmin = softmin
 
     def forward(self, *args):
         """Computes the loss between sampled measures.
@@ -285,7 +287,8 @@ class SamplesLoss(Module):
             labels_y=l_y,
             verbose=self.verbose,
             f_regularizer=self.f_regularizer,
-            g_regularizer=self.g_regularizer
+            g_regularizer=self.g_regularizer,
+            softmin=self.softmin
         )
 
         # Make sure that the output has the correct shape ------------------------------------
